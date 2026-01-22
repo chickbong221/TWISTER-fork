@@ -230,7 +230,7 @@ class TWISTER(models.Model):
         self.config.random_pre_fill_steps = True
 
         # Log Figure
-        self.config.log_figure_batch = 16
+        self.config.log_figure_batch = 1
         self.config.log_figure_context_frames = 5
 
         # Override Config
@@ -1349,7 +1349,7 @@ class TWISTER(models.Model):
             ###############################################################################
 
             # Model Observe (B, L, D)
-            posts, priors, _ = self.rssm.observe(
+            posts, priors = self.rssm.observe(
                 states=latent,
                 prev_actions=actions,
                 is_firsts=is_firsts,
@@ -1369,67 +1369,29 @@ class TWISTER(models.Model):
 
             # Initial State
             if self.config.log_figure_context_frames == 0:
-                # No context: Need 2 initial states for motion computation
-                initial_state = self.transfer_to_device(
-                    self.rssm.initial(batch_size=feats.shape[0], seq_length=2, dtype=feats.dtype)
-                )
-                prev_state = initial_state
-            elif self.config.log_figure_context_frames == 1:
-                # Only 1 context frame: duplicate it to create 2-timestep window
-                hidden_len = self.rssm.get_hidden_len(posts["hidden"])
-                prev_state = {
-                    k: [
-                        (
-                            v_blk[0][:, max(0, hidden_len - self.config.L):hidden_len - self.config.L + 1],
-                            v_blk[1][:, max(0, hidden_len - self.config.L):hidden_len - self.config.L + 1]
-                        ) for v_blk in v
-                    ] if k == "hidden" else (
-                        v[:, 0:1].repeat(1, 2, *([1] * (v.dim() - 2))) if k == "stoch" 
-                        else v[:, 0:1]
-                    ) for k, v in posts.items()
-                }
+                # No context, No hidden
+                prev_state = self.transfer_to_device(self.rssm.initial(batch_size=feats.shape[0], seq_length=1, dtype=feats.dtype))
             else:
-                # 2+ context frames: use last 2 frames for motion computation
-                context_start = self.config.log_figure_context_frames - 2
-                context_end = self.config.log_figure_context_frames
+                # context + hidden
                 hidden_len = self.rssm.get_hidden_len(posts["hidden"])
-                
-                prev_state = {
-                    k: [
-                        (
-                            v_blk[0][:, max(0, hidden_len - self.config.L + context_start - self.config.att_context_left):hidden_len - self.config.L + context_end],
-                            v_blk[1][:, max(0, hidden_len - self.config.L + context_start - self.config.att_context_left):hidden_len - self.config.L + context_end]
-                        ) for v_blk in v
-                    ] if k == "hidden" else (
-                        v[:, context_start:context_end] if k == "stoch"
-                        else v[:, context_end - 1:context_end]
-                    ) for k, v in posts.items()
+                prev_state = {k: [
+                    (
+                        v_blk[0][:, max(0, hidden_len-self.config.L+self.config.log_figure_context_frames-self.config.att_context_left):hidden_len-self.config.L+self.config.log_figure_context_frames], 
+                        v_blk[1][:, max(0, hidden_len-self.config.L+self.config.log_figure_context_frames-self.config.att_context_left):hidden_len-self.config.L+self.config.log_figure_context_frames]
+                    ) for v_blk in v] if k == "hidden" else v[:, self.config.log_figure_context_frames-1:self.config.log_figure_context_frames] for k, v in posts.items()
                 }
 
             # Model Imagine (B, 1+L-C, D)
             img_states = self.rssm.imagine(
-                p_net=self.policy_network,
-                prev_state=prev_state,
-                img_steps=self.config.L - self.config.log_figure_context_frames,
+                p_net=self.policy_network, 
+                prev_state=prev_state, 
+                img_steps=self.config.L-self.config.log_figure_context_frames,
                 is_firsts=None,
                 is_firsts_hidden=None
             )
 
             # Img States (B, L, ...)
-            # Note: img_states["stoch"] now starts with the most recent context state
-            if self.config.log_figure_context_frames == 0:
-                # No context: use all imagined states (skip the initial duplicated state)
-                states_img = self.decoder_network(
-                    img_states["stoch"][:, 1:].flatten(-2, -1)
-                ).mode()
-            else:
-                # With context: combine context frames with imagined states
-                states_img = self.decoder_network(
-                    torch.cat([
-                        posts["stoch"][:, :self.config.log_figure_context_frames].flatten(-2, -1),
-                        img_states["stoch"][:, 1:].flatten(-2, -1)
-                    ], dim=1)
-                ).mode()
+            states_img = self.decoder_network(torch.cat([posts["stoch"][:, :self.config.log_figure_context_frames].flatten(-2, -1) , img_states["stoch"][:, 1:].flatten(-2, -1)], dim=1)).mode()
 
         # Shift to 0..1 for display
         states_shift = states.clip(-0.5, 0.5) + 0.5
